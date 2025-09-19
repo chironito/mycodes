@@ -42,6 +42,7 @@ import xml.etree.ElementTree as ET
 from dotenv import load_dotenv
 assert load_dotenv("env.env"), "Environment File not Found."
 import pdfplumber  # MIT
+import difflib
 from xml.etree.ElementTree import Element, SubElement, ElementTree
 
 def strip_json_fencing(text: str) -> str:
@@ -122,6 +123,46 @@ Task:
 
 Return ONLY the corrected XML, nothing else."""
 
+DESTRUCTURE_PROMPT = """You are a strict document-structure corrector for parsed PDFs.
+
+INPUT:
+- A JSON object with a single page: { "page_number": int, "blocks": [ ... ] }.
+- Each block has: { "type": "paragraph" | "heading" | "list" | "table", ... }.
+- Sometimes a paragraph improperly contains an inlined, flattened table (header + data) plus real narrative sentences.
+- A nearby proper table block for the SAME content may also exist.
+
+TASK:
+1) Do NOT invent content. Only use tokens present in the input blocks.
+2) If a paragraph contains both real narrative and table residue:
+   - Preserve the narrative sentences as a clean paragraph.
+   - Remove the duplicated table residue (header/data tokens).
+3) If the paragraph begins with a title-like phrase (e.g., “Safety Summary”, “Efficacy Results”), convert that phrase into a separate heading block (level=2 or 3). Keep the remaining sentences as a paragraph.
+4) If a proper table block exists for the same content, DO NOT alter its cell values and DO NOT duplicate the table in text.
+5) Keep original block order as much as possible, except for splitting a paragraph into [heading?, paragraph].
+6) Preserve existing 'bbox' fields when splitting text; use the paragraph's bbox for the new heading and paragraph; leave table bbox unchanged.
+7) If the document-structure requires no correction, return the document as is.
+8) Return JSON ONLY in this schema:
+
+{
+  "page_number": <int>,
+  "blocks": [
+    { "type": "heading", "level": 2|3, "text": "<...>", "bbox": [ ... ] }?,
+    { "type": "paragraph", "text": "<...>", "bbox": [ ... ] }?,
+    { "type": "table", "rows": [[...],[...],...], "bbox": <null or [ ... ]> }?,
+    ...
+  ],
+  "notes": {
+    "changed_blocks": <int>,           // how many blocks were modified or split
+    "removed_table_residue": true|false,
+    "explanations": ["short notes..."]
+  }
+}
+
+Rules:
+- NEVER add new rows/cells or change numbers in tables.
+- NEVER produce extra keys or different schema.
+- If nothing needs fixing, return the input unchanged (same schema)."""
+
 def call_llm(system_prompt: str, broken: str, error_msg: str) -> str:
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['togetherai_api_key']}"}
     payload = {"messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": broken}], "model": "openai/gpt-oss-120b"}
@@ -185,6 +226,22 @@ def xml_correction_llm(xml_string: str):
     else:
         return corrected_xml_string
 
+def destructure_llm(block, retries: int=0, max_retries: int=3):
+    if not isinstance(block, str):
+        block_string = json.dumps(block)
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ['togetherai_api_key']}"}
+    payload = {"messages": [{"role": "system", "content": DESTRUCTURE_PROMPT}, {"role": "user", "content": block_string}], "model": "openai/gpt-oss-20b"}
+    try:
+        r = requests.post(os.environ['togetherai_api_endpoint'], json=payload, headers=headers)
+        try:
+            return json.loads(strip_json_fencing(r.json()["choices"][0]["message"]["content"]))
+        except json.JSONDecodeError as exp:
+            return json.loads(strip_json_fencing(fix_json(strip_json_fencing(r.json()["choices"][0]["message"]["content"]), str(exp))))
+    except Exception as exp:
+        if retries >= max_retries:
+            raise RuntimeError("Max retries reached.")
+        return destructure_llm(block, retries+1)
+        
 # -----------------------------
 # Tunables
 # -----------------------------
@@ -224,6 +281,9 @@ COVER_NOISE = re.compile(
     r"(advance\s+unedited|summary\s+of\s+results|world\s+population\s+prospects)\b",
     re.I,
 )
+
+BULLET_RE = re.compile(r"^\s*([•·◦\-\*\u2022\u25CF\u25E6]|\(?[0-9ivxlcdm]+\)|[0-9]+[\.)]|[A-Za-z]\.)\s+", re.IGNORECASE)
+MD_TABLE_SEP = re.compile(r"^\s*\|.*\|\s*$")
 
 # -----------------------------
 # Helpers
@@ -417,7 +477,241 @@ def extract_tables(page: pdfplumber.page.Page) -> List[List[List[Optional[str]]]
 # Core pipeline
 # -----------------------------
 
-def parse_pdf(path: str, heading_rules: HeadingHeuristics) -> Dict[str, Any]:
+def remove_duplicates(page_blocks):
+    tables_present = []
+    i = 0
+    while i < len(page_blocks):
+        entry = page_blocks[i]
+        if entry in tables_present:
+            page_blocks.pop(i)
+        else:
+            tables_present.append(entry)
+            i += 1
+    return page_blocks
+    
+def remove_doc_duplicates(doc):
+    try:
+        for page_entry in doc['document']['pages']:
+            remove_duplicates(page_entry['blocks'])
+    except KeyError:
+        pass
+    return doc
+
+import re
+from typing import List
+
+def _md_escape(s: str) -> str:
+    # Escape pipes; keep other chars verbatim
+    return (s or "").replace("|", r"\|").strip()
+
+def _looks_header(row: List[str]) -> bool:
+    """
+    Heuristic: header if all cells are non-empty AND
+    at least half are non-numeric-ish.
+    """
+    if not row or any(c.strip() == "" for c in row):
+        return False
+    def non_numeric(c: str) -> bool:
+        c = c.strip()
+        return not re.fullmatch(r"[0-9.,%()\-+\s]+", c)
+    nonnum = sum(1 for c in row if non_numeric(c))
+    return nonnum >= max(1, len(row) // 2)
+
+def _split_if_single_col(row: List[str]) -> List[str]:
+    """
+    If we got a 'table' row with a single fat cell (common when upstream
+    lost cell boundaries), try splitting by 2+ spaces or tabs.
+    """
+    if len(row) != 1:
+        return row
+    txt = row[0]
+    # If there are pipes already, respect them.
+    if "|" in txt:
+        return [c.strip() for c in txt.strip().strip("|").split("|")]
+    # Split on runs of 2+ spaces or tabs
+    parts = re.split(r"(?: {2,}|\t+)", txt.strip())
+    # Require at least 2 columns to accept the split
+    return [p.strip() for p in parts] if len(parts) >= 2 else row
+
+def _normalize_table_rows(rows: List[List[str]]) -> List[List[str]]:
+    # Drop fully empty rows; split single-wide rows opportunistically
+    cleaned = []
+    for r in rows:
+        r = [ (c if c is not None else "").strip() for c in r ]
+        if len(r) == 1:
+            r = _split_if_single_col(r)
+        if any(c.strip() for c in r):
+            cleaned.append(r)
+
+    if not cleaned:
+        return []
+
+    # Make rectangular: pad to max columns
+    max_cols = max(len(r) for r in cleaned)
+    rect = [ (r + [""]*(max_cols - len(r))) for r in cleaned ]
+
+    # Trim trailing empty columns
+    # If the last column is empty across all rows, drop it (repeat)
+    while rect and all((row and row[-1].strip() == "") for row in rect) and len(rect[0]) > 1:
+        rect = [row[:-1] for row in rect]
+
+    return rect
+
+def table_to_md(rows: List[List[str]]) -> str:
+    """
+    Robust Markdown table:
+      - makes rows rectangular
+      - synthesizes a header if needed
+      - escapes pipes; converts newlines in cells to <br>
+    """
+    rect = _normalize_table_rows(rows)
+    if not rect:
+        return ""
+
+    # Convert embedded newlines to <br> to avoid breaking Markdown tables
+    rect = [[_md_escape(c).replace("\n", "<br>") for c in r] for r in rect]
+
+    # If first row doesn't look like a header, synthesize one
+    header = rect[0]
+    body = rect[1:]
+    if not _looks_header(header):
+        header = [f"Col {i+1}" if (not c) else c for i, c in enumerate(header)]
+        # Keep original first row as body
+        body = rect
+
+    sep = ["---"] * len(header)
+    lines = [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(sep)    + " |",
+    ]
+    for r in body:
+        lines.append("| " + " | ".join(r) + " |")
+    return "\n".join(lines)
+
+def doc_to_markdown(doc: dict, page_separator: str = "\n\n---\n\n") -> str:
+    """
+    Render the normalized JSON schema to Markdown.
+    More defensive table handling; everything else unchanged.
+    """
+    out_pages = []
+    for page in doc.get("document", {}).get("pages", []):
+        chunks = []
+        for b in page.get("blocks", []):
+            t = b.get("type")
+            if t == "heading":
+                lvl = min(3, int(b.get("level", 3)))
+                text = (b.get("text") or "").strip()
+                if text:
+                    chunks.append("#" * lvl + " " + text)
+            elif t == "paragraph":
+                text = (b.get("text") or "").strip()
+                if text:
+                    chunks.append(text)
+            elif t == "list":
+                items = b.get("items") or []
+                ordered = bool(b.get("ordered"))
+                for i, it in enumerate(items, 1):
+                    it = (it or "").strip()
+                    if not it:
+                        continue
+                    prefix = f"{i}. " if ordered else "- "
+                    chunks.append(prefix + it)
+            elif t == "table":
+                rows = b.get("rows") or []
+                md = table_to_md(rows)
+                if md:
+                    chunks.append(md)
+            else:
+                # Graceful fallback
+                text = (b.get("text") or b.get("raw") or "").strip()
+                if text:
+                    chunks.append(text)
+        out_pages.append("\n\n".join(chunks))
+    return page_separator.join(out_pages)
+
+_WS_COL_SPLIT = re.compile(r"(?:\s{2,}|\t+)")
+_PIPE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+
+def _norm_text(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip().lower()
+
+def _tokenize(s: str) -> List[str]:
+    return re.findall(r"[a-z0-9%]+", _norm_text(s))
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    if not a or not b:
+        return 0.0
+    A, B = set(a), set(b)
+    inter = len(A & B)
+    union = len(A | B)
+    return inter / union if union else 0.0
+
+def _looks_like_joined_header(p: str, header_cells: List[str]) -> bool:
+    p_norm = _norm_text(p)
+    # try pipe-joined
+    if "|".join([c.strip() for c in header_cells]).lower() in p_norm.replace(" ", ""):
+        return True
+    # try explicit pipes
+    if _PIPE_ROW.match(p):  # already looks like a markdown table row
+        return True
+    # try whitespace columns
+    parts = [x for x in _WS_COL_SPLIT.split(p.strip()) if x.strip()]
+    if len(parts) >= max(2, len(header_cells) // 2):
+        # if many parts match header cells, count it
+        hits = sum(1 for part in parts for hc in header_cells if _norm_text(hc) == _norm_text(part))
+        if hits >= max(1, len(header_cells) // 2):
+            return True
+    return False
+
+def _is_duplicate_para_of_header(para_text: str, header_cells: List[str],
+                                 jaccard_thr: float = 0.75, fuzzy_thr: float = 0.82) -> bool:
+    p_tok = _tokenize(para_text)
+    h_tok = _tokenize(" ".join(header_cells))
+    jac = _jaccard(p_tok, h_tok)
+    if jac >= jaccard_thr:
+        return True
+    ratio = difflib.SequenceMatcher(None, _norm_text(para_text), _norm_text(" ".join(header_cells))).ratio()
+    if ratio >= fuzzy_thr:
+        return True
+    if _looks_like_joined_header(para_text, header_cells):
+        return True
+    return False
+
+def suppress_flat_header_paragraphs(doc: Dict) -> Tuple[Dict, Dict]:
+    """
+    Remove paragraph blocks that duplicate the header of a nearby table.
+    Returns (new_doc, stats).
+    """
+    removed = 0
+    inspected = 0
+    for page in doc.get("document", {}).get("pages", []):
+        blocks = page.get("blocks", [])
+        keep: List[Dict] = []
+        i = 0
+        while i < len(blocks):
+            b = blocks[i]
+            if b.get("type") == "paragraph":
+                inspected += 1
+                # look ahead for a table within 2 positions
+                found_tbl = None
+                for j in range(i+1, min(i+3, len(blocks))):
+                    if blocks[j].get("type") == "table":
+                        found_tbl = blocks[j]
+                        break
+                if found_tbl:
+                    rows = found_tbl.get("rows") or []
+                    header = rows[0] if rows else []
+                    if header and _is_duplicate_para_of_header(b.get("text", ""), header):
+                        removed += 1
+                        i += 1
+                        continue  # drop this paragraph
+            keep.append(b)
+            i += 1
+        page["blocks"] = keep
+    stats = {"paragraphs_inspected": inspected, "paragraphs_removed": removed}
+    return doc, stats
+
+def parse_pdf(path: str, heading_rules: HeadingHeuristics, use_llm: bool=True) -> Dict[str, Any]:
     doc: Dict[str, Any] = {
         "document": {
             "meta": {
@@ -452,7 +746,573 @@ def parse_pdf(path: str, heading_rules: HeadingHeuristics) -> Dict[str, Any]:
                 "page_number": pageno,
                 "blocks": blocks,
             })
-    return doc
+    doc = remove_doc_duplicates(doc)
+    doc, stats = suppress_flat_header_paragraphs(doc)
+    print("[dedupe]", stats)
+    if use_llm:
+        try:
+            for i, page_entry in enumerate(doc["document"]["pages"]):
+                if any(block_entry.get('type', 'N/A') == 'table' for block_entry in page_entry['blocks']):
+                    print(f"Fixing table block in page: {i+1}")
+                    doc["document"]["pages"][i] = destructure_llm(page_entry)
+        except KeyError:
+            pass
+    return doc, doc_to_markdown(doc)
+
+def lexical_heading_ok(text: str, hh) -> bool:
+    """
+    Decide if a text line is a heading based on lexical heuristics only.
+    - At least min_len characters
+    - At least min_alpha alphabetic characters
+    - Allow short headings ending with ':' if allow_short_if_colon is True
+    - Bias toward ALL CAPS or Title Case with few words
+    """
+    s = text.strip()
+    if not s:
+        return False
+    if len(s) < hh.min_len and not (hh.allow_short_if_colon and s.endswith(":")):
+        return False
+    if sum(ch.isalpha() for ch in s) < hh.min_alpha:
+        return False
+    if s.endswith(":"):
+        return True
+    if s.isupper() and len(s) >= hh.min_len:
+        return True
+    if s.istitle() and len(s.split()) <= 8:
+        return True
+    return False
+
+def as_heading(text: str, level: int) -> Dict:
+    return {"type": "heading", "level": level, "text": text.strip()}
+
+
+def as_paragraph(text: str) -> Dict:
+    return {"type": "paragraph", "text": text.strip()}
+
+
+def as_list(items: List[str], ordered: bool) -> Dict:
+    return {"type": "list", "ordered": ordered, "items": [i.strip() for i in items if i.strip()]}
+
+
+def as_table(rows: List[List[str]]) -> Dict:
+    norm = [[("" if c is None else str(c)).strip() for c in row] for row in rows]
+    return {"type": "table", "rows": norm}
+
+def size_to_level(size: float, median: float, hh) -> Optional[int]:
+    """
+    Decide heading level based on font size relative to median.
+    Expects hh to be a HeadingHeuristics object with h1_factor, h2_factor, h3_factor, min_abs_pt.
+    """
+    if size >= max(hh.min_abs_pt, median * hh.h1_factor):
+        return 1
+    if size >= max(hh.min_abs_pt, median * hh.h2_factor):
+        return 2
+    if size >= max(hh.min_abs_pt, median * hh.h3_factor):
+        return 3
+    return None
+
+def parse_pdf_pymupdf(path: str, heading_rules: HeadingHeuristics, use_llm: bool=True) -> Dict[str, Any]:
+    import fitz  # PyMuPDF
+
+    doc = {
+        "document": {
+            "meta": {
+                "source_pdf": os.path.abspath(path),
+                "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "generator": "pdf→json/xml pipeline (pymupdf)",
+                "licenses": {"pymupdf": "AGPL-3 (commercial license available)"},
+            },
+            "pages": [],
+        }
+    }
+
+    with fitz.open(path) as pdf:
+        for pageno, page in enumerate(pdf, 1):
+            # --- text lines (unchanged from your current version) ---
+            td = page.get_text("dict")
+            sizes, lines = [], []
+            for b in td.get("blocks", []):
+                for l in b.get("lines", []):
+                    spans = l.get("spans", [])
+                    if not spans: 
+                        continue
+                    text = "".join(s.get("text", "") for s in spans).strip()
+                    if not text:
+                        continue
+                    mean_sz = sum(s.get("size", 0) for s in spans) / len(spans)
+                    sizes.append(mean_sz)
+                    lines.append((text, mean_sz))
+
+            median = (sorted(sizes)[len(sizes)//2] if sizes else 0.0)
+            blocks = []
+            for text, sz in lines:
+                lvl = size_to_level(sz, median, heading_rules)
+                if lvl and lexical_heading_ok(text, heading_rules):
+                    blocks.append({"type": "heading", "level": lvl, "text": text})
+                elif BULLET_REGEX.match(text):
+                    ordered = bool(re.match(r"^\s*(\(?[0-9ivxlcdm]+\)|[0-9]+[.)]|[A-Za-z]\.)\s+", text, re.I))
+                    blocks.append({"type": "list", "ordered": ordered, "items": [BULLET_REGEX.sub("", text).strip()]})
+                else:
+                    blocks.append({"type": "paragraph", "text": text})
+
+            # --- tables via PyMuPDF ---
+            try:
+                # strategy options: "lines", "lines_strict", "text"
+                tab_finder = page.find_tables(strategy="lines")
+                for tbl in tab_finder.tables or []:
+                    rows = tbl.extract()  # -> list[list[str]]
+                    if rows and len(rows) >= 2 and max(len(r) for r in rows) >= 2:
+                        blocks.append({"type": "table", "rows": rows})
+            except Exception:
+                # fallback to no tables if detection fails
+                pass
+
+            doc["document"]["pages"].append({"page_number": pageno, "blocks": blocks})
+
+    doc = remove_doc_duplicates(doc)
+    doc, stats = suppress_flat_header_paragraphs(doc)
+    print("[dedupe]", stats)
+    if use_llm:
+        try:
+            for i, page_entry in enumerate(doc["document"]["pages"]):
+                if any(block_entry.get('type', 'N/A') == 'table' for block_entry in page_entry['blocks']):
+                    print(f"Fixing table block in page: {i+1}")
+                    doc["document"]["pages"][i] = destructure_llm(page_entry)
+        except KeyError:
+            pass
+    return doc, doc_to_markdown(doc)
+
+
+def parse_pdf_pdfminer(path: str, heading_rules: HeadingHeuristics) -> Dict[str, Any]:
+    from pdfminer.high_level import extract_text
+
+    doc: Dict[str, Any] = {
+        "document": {
+            "meta": {
+                "source_pdf": os.path.abspath(path),
+                "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "generator": "pdf→json/xml pipeline (pdfminer.six)",
+                "licenses": {"pdfminer.six": "MIT"},
+            },
+            "pages": [],
+        }
+    }
+
+    def classify_text_line(text: str) -> Dict[str, Any]:
+        s = text.strip()
+        if not s:
+            return {"type": "paragraph", "text": s}
+        # light lexical heading heuristic (since we lack font sizes)
+        looks_heading = (
+            (s.endswith(":") and len(s) >= heading_rules.min_len) or
+            (sum(ch.isalpha() for ch in s) >= heading_rules.min_alpha and
+             (s.isupper() or s.istitle()) and len(s) >= heading_rules.min_len)
+        )
+        if looks_heading:
+            return {"type": "heading", "level": 3, "text": s}
+        if BULLET_REGEX.match(s):
+            ordered = bool(re.match(r"^\s*(\(?[0-9ivxlcdm]+\)|[0-9]+[.)]|[A-Za-z]\.)\s+", s, re.I))
+            return {"type": "list", "ordered": ordered, "items": [BULLET_REGEX.sub("", s).strip()]}
+        return {"type": "paragraph", "text": s}
+
+    full = extract_text(path) or ""
+    pages = full.split("\x0c")  # pdfminer inserts form feed between pages
+
+    for pageno, page_text in enumerate(pages, start=1):
+        raw_lines = [ln for ln in (page_text or "").splitlines()]
+        blocks: List[Dict[str, Any]] = []
+        # simple paragraph coalescing by blank lines
+        buf: List[str] = []
+        def flush_para():
+            nonlocal buf
+            if buf:
+                blocks.append({"type": "paragraph", "text": " ".join(x.strip() for x in buf).strip()})
+                buf = []
+
+        for line in raw_lines:
+            if not line.strip():
+                flush_para()
+                continue
+            # classify single lines that clearly look like headings/bullets; else buffer as paragraph
+            if BULLET_REGEX.match(line) or line.strip().endswith(":"):
+                flush_para()
+                blocks.append(classify_text_line(line))
+            else:
+                # try heading first
+                maybe = classify_text_line(line)
+                if maybe["type"] == "heading":
+                    flush_para()
+                    blocks.append(maybe)
+                elif maybe["type"] == "list":
+                    flush_para()
+                    blocks.append(maybe)
+                else:
+                    buf.append(line)
+        flush_para()
+        doc["document"]["pages"].append({"page_number": pageno, "blocks": blocks})
+
+    doc = remove_doc_duplicates(doc)
+    doc, stats = suppress_flat_header_paragraphs(doc)
+    print("[dedupe]", stats)
+    return doc, doc_to_markdown(doc)
+
+
+def parse_pdf_pypdf2(path: str, heading_rules: HeadingHeuristics) -> Dict[str, Any]:
+    import PyPDF2
+
+    doc: Dict[str, Any] = {
+        "document": {
+            "meta": {
+                "source_pdf": os.path.abspath(path),
+                "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "generator": "pdf→json/xml pipeline (PyPDF2)",
+                "licenses": {"PyPDF2": "BSD-3-Clause"},
+            },
+            "pages": [],
+        }
+    }
+
+    def classify_text_line(text: str) -> Dict[str, Any]:
+        s = text.strip()
+        if not s:
+            return {"type": "paragraph", "text": s}
+        looks_heading = (
+            (s.endswith(":") and len(s) >= heading_rules.min_len) or
+            (sum(ch.isalpha() for ch in s) >= heading_rules.min_alpha and
+             (s.isupper() or s.istitle()) and len(s) >= heading_rules.min_len)
+        )
+        if looks_heading:
+            return {"type": "heading", "level": 3, "text": s}
+        if BULLET_REGEX.match(s):
+            ordered = bool(re.match(r"^\s*(\(?[0-9ivxlcdm]+\)|[0-9]+[.)]|[A-Za-z]\.)\s+", s, re.I))
+            return {"type": "list", "ordered": ordered, "items": [BULLET_REGEX.sub("", s).strip()]}
+        return {"type": "paragraph", "text": s}
+
+    reader = PyPDF2.PdfReader(path)
+    for pageno, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        raw_lines = text.splitlines()
+        blocks: List[Dict[str, Any]] = []
+        buf: List[str] = []
+
+        def flush_para():
+            nonlocal buf
+            if buf:
+                blocks.append({"type": "paragraph", "text": " ".join(x.strip() for x in buf).strip()})
+                buf = []
+
+        for line in raw_lines:
+            if not line.strip():
+                flush_para()
+                continue
+            if BULLET_REGEX.match(line) or line.strip().endswith(":"):
+                flush_para()
+                blocks.append(classify_text_line(line))
+            else:
+                maybe = classify_text_line(line)
+                if maybe["type"] in ("heading", "list"):
+                    flush_para(); blocks.append(maybe)
+                else:
+                    buf.append(line)
+        flush_para()
+        doc["document"]["pages"].append({"page_number": pageno, "blocks": blocks})
+
+    doc = remove_doc_duplicates(doc)
+    doc, stats = suppress_flat_header_paragraphs(doc)
+    print("[dedupe]", stats)
+    return doc, doc_to_markdown(doc)
+
+
+def parse_pdf_pypdfium2(path: str, heading_rules: HeadingHeuristics) -> Dict[str, Any]:
+    import pypdfium2 as pdfium
+
+    doc: Dict[str, Any] = {
+        "document": {
+            "meta": {
+                "source_pdf": os.path.abspath(path),
+                "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+                "generator": "pdf→json/xml pipeline (pypdfium2)",
+                "licenses": {"pypdfium2": "BSD-3-Clause"},
+            },
+            "pages": [],
+        }
+    }
+
+    def classify_text_line(text: str) -> Dict[str, Any]:
+        s = text.strip()
+        if not s:
+            return {"type": "paragraph", "text": s}
+        looks_heading = (
+            (s.endswith(":") and len(s) >= heading_rules.min_len) or
+            (sum(ch.isalpha() for ch in s) >= heading_rules.min_alpha and
+             (s.isupper() or s.istitle()) and len(s) >= heading_rules.min_len)
+        )
+        if looks_heading:
+            return {"type": "heading", "level": 3, "text": s}
+        if BULLET_REGEX.match(s):
+            ordered = bool(re.match(r"^\s*(\(?[0-9ivxlcdm]+\)|[0-9]+[.)]|[A-Za-z]\.)\s+", s, re.I))
+            return {"type": "list", "ordered": ordered, "items": [BULLET_REGEX.sub("", s).strip()]}
+        return {"type": "paragraph", "text": s}
+
+    pdf = pdfium.PdfDocument(path)
+    try:
+        for pageno in range(len(pdf)):
+            page = pdf.get_page(pageno)
+            textpage = page.get_textpage()
+            text = textpage.get_text_range() or ""
+            textpage.close(); page.close()
+
+            raw_lines = text.splitlines()
+            blocks: List[Dict[str, Any]] = []
+            buf: List[str] = []
+
+            def flush_para():
+                nonlocal buf
+                if buf:
+                    blocks.append({"type": "paragraph", "text": " ".join(x.strip() for x in buf).strip()})
+                    buf = []
+
+            for line in raw_lines:
+                if not line.strip():
+                    flush_para()
+                    continue
+                if BULLET_REGEX.match(line) or line.strip().endswith(":"):
+                    flush_para()
+                    blocks.append(classify_text_line(line))
+                else:
+                    maybe = classify_text_line(line)
+                    if maybe["type"] in ("heading", "list"):
+                        flush_para(); blocks.append(maybe)
+                    else:
+                        buf.append(line)
+            flush_para()
+            doc["document"]["pages"].append({"page_number": pageno+1, "blocks": blocks})
+    finally:
+        pdf.close()
+    doc, stats = suppress_flat_header_paragraphs(doc)
+    print("[dedupe]", stats)
+    doc = remove_doc_duplicates(doc)
+
+    return doc, doc_to_markdown(doc)
+
+def text_only_segment(
+    lines: List[str],
+    hh: Optional[HeadingHeuristics] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Segment plain text lines into blocks:
+      - blank line → paragraph break
+      - Markdown headings:  # / ## / ###
+      - bullets / ordered lists (•, -, *, 1., a., i., etc.)
+      - Markdown tables: lines starting/continuing with pipes
+      - fallback lexical headings (ALL-CAPS/Title + trailing ':')
+
+    Returns a list of blocks in your common schema.
+    """
+    if hh is None:
+        hh = HeadingHeuristics()
+
+    blocks: List[Dict[str, Any]] = []
+    buf: List[str] = []
+
+    HEADING_MD = re.compile(r"^(#{1,6})\s+(.*)$")
+    ORDERED_PREFIX = re.compile(r"^\s*(?:\(?[0-9ivxlcdm]+\)|[0-9]+[.)]|[A-Za-z][.)])\s+", re.IGNORECASE)
+
+    def flush_para():
+        nonlocal buf
+        if buf:
+            para = " ".join(s.strip() for s in buf).strip()
+            if para:
+                blocks.append({"type": "paragraph", "text": para})
+            buf = []
+
+    def lexical_heading_ok(text: str) -> bool:
+        s = text.strip()
+        if not s:
+            return False
+        if len(s) < hh.min_len and not (hh.allow_short_if_colon and s.endswith(":")):
+            return False
+        if sum(ch.isalpha() for ch in s) < hh.min_alpha:
+            return False
+        # Gentle bias toward headings when text is ALL CAPS or Title Case, or ends with colon
+        if s.endswith(":"):
+            return True
+        if s.isupper() and len(s) >= hh.min_len:
+            return True
+        if s.istitle() and len(s.split()) <= 8:
+            return True
+        return False
+
+    i = 0
+    N = len(lines)
+    while i < N:
+        line = (lines[i] or "").rstrip("\n")
+
+        # Paragraph break
+        if not line.strip():
+            flush_para()
+            i += 1
+            continue
+
+        # Markdown heading (#, ##, ### ...)
+        m = HEADING_MD.match(line)
+        if m:
+            flush_para()
+            level = min(3, len(m.group(1)))
+            text = m.group(2).strip()
+            if text:
+                blocks.append({"type": "heading", "level": level, "text": text})
+            i += 1
+            continue
+
+        # Markdown table block (one or more consecutive pipe-lines)
+        if MD_TABLE_SEP.match(line):
+            flush_para()
+            tbl_lines = [line]
+            i += 1
+            while i < N and MD_TABLE_SEP.match(lines[i] or ""):
+                tbl_lines.append((lines[i] or "").rstrip("\n"))
+                i += 1
+            # Simple split by pipe; caller can post-process if needed
+            rows = [
+                [c.strip() for c in row.strip().strip("|").split("|")]
+                for row in tbl_lines
+            ]
+            if rows:
+                blocks.append({"type": "table", "rows": rows})
+            continue
+
+        # Bullet / ordered lists: consume consecutive bullet lines
+        if BULLET_RE.match(line):
+            flush_para()
+            items: List[str] = []
+            # detect ordered vs unordered from the first item
+            ordered = bool(ORDERED_PREFIX.match(line))
+            while i < N and (lines[i] or "").strip() and BULLET_RE.match(lines[i] or ""):
+                item_text = BULLET_RE.sub("", (lines[i] or "")).strip()
+                if item_text:
+                    items.append(item_text)
+                i += 1
+            if items:
+                blocks.append({"type": "list", "ordered": ordered, "items": items})
+            continue
+
+        # Fallback: treat standalone “heading-like” lines as headings
+        if lexical_heading_ok(line):
+            flush_para()
+            blocks.append({"type": "heading", "level": 3, "text": line.strip()})
+            i += 1
+            continue
+
+        # Otherwise, accumulate into a paragraph
+        buf.append(line)
+        i += 1
+
+    flush_para()
+    return blocks
+
+def parse_markdown_string(md: str) -> List[Dict[str, Any]]:
+    lines = md.splitlines()
+    return text_only_segment(lines)
+
+def make_doc_meta(src_pdf: str) -> Dict[str, Any]:
+    return {
+    "source_pdf": os.path.abspath(src_pdf),
+    "created_utc": dt.datetime.utcnow().isoformat() + "Z",
+    "generator": "multi-backend pdf→json/xml",
+    }
+
+def new_doc(src_pdf: str) -> Dict[str, Any]:
+    return {"document": {"meta": make_doc_meta(src_pdf), "pages": []}}
+
+def save_markdown(md: str, out_base: str, backend: str):
+    md_path = out_base + f".{backend}.md"
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md)
+    print(f"[+] wrote markdown {md_path}")
+    return md_path
+
+def parse_with_docling(path: str, hh: HeadingHeuristics) -> Tuple[Dict[str, Any], Optional[str]]:
+    from docling.document_converter import DocumentConverter
+    conv = DocumentConverter()
+    result = conv.convert(path)
+    md = result.document.export_to_markdown()
+    blocks = parse_markdown_string(md)
+    doc = new_doc(path)
+    doc["document"]["pages"].append({"page_number": 1, "blocks": blocks})
+    return doc, md
+
+def parse_with_markitdown(path: str, hh: HeadingHeuristics) -> Tuple[Dict[str, Any], Optional[str]]:
+    from markitdown import MarkItDown
+    md = MarkItDown().convert(path).text_content
+    blocks = parse_markdown_string(md)
+    doc = new_doc(path)
+    doc["document"]["pages"].append({"page_number": 1, "blocks": blocks})
+    return doc, md
+
+def parse_with_markdrop(path: str, hh):
+    """
+    Markdrop backend. Writes Markdown/HTML to an output dir; we read the .md back.
+    WARNING: License appears inconsistent (PyPI=MIT, repo=GPL-3.0). Verify before use.
+    Returns (doc, md_str).
+    """
+
+    import os, glob, subprocess, shlex, tempfile
+    from pathlib import Path
+    
+    outdir = Path(tempfile.mkdtemp(prefix="markdrop_out_"))
+    md_text = None
+
+    # Try Python API first
+    try:
+        from markdrop import markdrop as md_convert
+        from markdrop import MarkDropConfig
+        cfg = MarkDropConfig()  # you can tune image/table options here
+        html_path = md_convert(path, str(outdir), cfg)  # writes .md in outdir
+    except Exception:
+        # Fallback to CLI
+        cmd = f"markdrop convert {shlex.quote(path)} --output_dir {shlex.quote(str(outdir))}"
+        try:
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            raise RuntimeError(f"markdrop failed: {e}")
+
+    # Find the Markdown file Markdrop wrote
+    mds = sorted(glob.glob(str(outdir / "*.md")))
+    if not mds:
+        raise RuntimeError(f"markdrop produced no .md in {outdir}")
+    md_file = mds[0]
+    with open(md_file, "r", encoding="utf-8") as f:
+        md_text = f.read()
+
+    # Parse Markdown → blocks using your existing segmenter
+    blocks = parse_markdown_string(md_text)
+    doc = new_doc(path)
+    doc["document"]["pages"].append({"page_number": 1, "blocks": blocks})
+    return doc, md_text
+
+def parse_with_marker(path: str, hh: HeadingHeuristics):
+    """
+    Marker backend (marker-pdf). Converts to Markdown (default), then we parse MD → blocks.
+    Requires: pip install marker-pdf (and PyTorch). License: GPL (code) + OpenRAIL-M (weights).
+    """
+    try:
+        from marker.converters.pdf import PdfConverter
+        from marker.models import create_model_dict
+        from marker.output import text_from_rendered
+    except Exception as e:
+        raise RuntimeError(f"marker not installed or import failed: {e}")
+
+    # Build converter; you can pass config to get JSON/HTML directly if preferred.
+    converter = PdfConverter(artifact_dict=create_model_dict())
+    rendered = converter(path)  # default output_format=markdown
+    md, _meta, _images = text_from_rendered(rendered)
+
+    # Reuse your Markdown -> blocks segmenter
+    blocks = parse_markdown_string(md)
+    doc = new_doc(path)
+    doc["document"]["pages"].append({"page_number": 1, "blocks": blocks})
+    return doc, md  # keep returning md so you can --save-md
 
 # -----------------------------
 # Serialization
@@ -520,6 +1380,18 @@ def write_xml(doc: Dict[str, Any], out_path: str) -> None:
     tree = ElementTree(root)
     tree.write(out_path, encoding="utf-8", xml_declaration=True)
 
+backend_map = {
+        "pdfplumber": parse_pdf,
+        "pymupdf": parse_pdf_pymupdf,
+        "pypdf2": parse_pdf_pypdf2,
+        "pdfminer": parse_pdf_pdfminer,
+        "pypdfium2": parse_pdf_pypdfium2,
+        "docling": parse_with_docling,
+        "markitdown": parse_with_markitdown,
+        "markdrop": parse_with_markdrop,
+        "markerpdf": parse_with_marker,
+    }
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -528,12 +1400,14 @@ def main():
     ap = argparse.ArgumentParser(description="Parse PDF → JSON & XML (no AGPL/GPL)")
     ap.add_argument("pdf", help="Path to input PDF")
     ap.add_argument("--out-base", required=False, default=None, help="Output base path without extension (default: alongside PDF)")
-    ap.add_argument("--h1", type=float, default=HeadingHeuristics.h1_factor, help="Heading-1 factor vs median font size")
-    ap.add_argument("--h2", type=float, default=HeadingHeuristics.h2_factor, help="Heading-2 factor vs median font size")
-    ap.add_argument("--h3", type=float, default=HeadingHeuristics.h3_factor, help="Heading-3 factor vs median font size")
-    ap.add_argument("--minpt", type=float, default=HeadingHeuristics.min_abs_pt, help="Minimum absolute font size for headings")
-    ap.add_argument("--minlen", type=int, default=HeadingHeuristics.min_len, help="Minimum text length for headings")
-    ap.add_argument("--minalpha", type=int, default=HeadingHeuristics.min_alpha, help="Minimum alphabetic chars for headings")
+    ap.add_argument("--h1", type=float, default=HeadingHeuristics.h1_factor, help=f"Heading-1 factor vs median font size (default: {HeadingHeuristics.h1_factor})")
+    ap.add_argument("--h2", type=float, default=HeadingHeuristics.h2_factor, help=f"Heading-2 factor vs median font size (default: {HeadingHeuristics.h2_factor})")
+    ap.add_argument("--h3", type=float, default=HeadingHeuristics.h3_factor, help=f"Heading-3 factor vs median font size (default: {HeadingHeuristics.h3_factor})")
+    ap.add_argument("--minpt", type=float, default=HeadingHeuristics.min_abs_pt, help=f"Minimum absolute font size for headings (default: {HeadingHeuristics.min_abs_pt})")
+    ap.add_argument("--minlen", type=int, default=HeadingHeuristics.min_len, help=f"Minimum text length for headings (default: {HeadingHeuristics.min_len})")
+    ap.add_argument("--minalpha", type=int, default=HeadingHeuristics.min_alpha, help=f"Minimum alphabetic chars for headings (default: {HeadingHeuristics.min_alpha})")
+    ap.add_argument("--backend", type=str, default="pdfplumber", help="Available backends: {backends}".format(backends="\n".join(f"- {backend_name}" for backend_name in backend_map)))
+    # ap.add_argument("--use_llm", action=argparse.BooleanOptionalAction)
     args = ap.parse_args()
 
     if args.out_base is None:
@@ -544,22 +1418,31 @@ def main():
     os.makedirs(os.path.dirname(out_base) or ".", exist_ok=True)
 
     hh = HeadingHeuristics(args.h1, args.h2, args.h3, args.minpt, args.minlen, args.minalpha)
-    doc = parse_pdf(args.pdf, hh)
+
+    pdf_parse_function = backend_map.get(args.backend, backend_map["pdfplumber"])
+
+    try:
+        print(f"Using backend engine: {pdf_parse_function.__name__}")
+    except AttributeError:
+        print(f"Using backend engine: {pdf_parse_function}")
+
+    doc, md = pdf_parse_function(args.pdf, hh)
 
     json_path = out_base + ".json"
     xml_path = out_base + ".xml"
+    md_path = out_base + ".md"
 
-    write_json(doc, json_path)
-    write_xml(doc, xml_path)
+    try:
+        os.mkdir(args.backend + "_output")
+    except FileExistsError:
+        pass
+
+    write_json(doc, os.path.join(args.backend + "_output", json_path))
+    write_xml(doc, os.path.join(args.backend + "_output", xml_path))
     
-    with open(json_path) as f:
-        json_generated = f.read()
-    with open(json_path, "w") as f:
-        json.dump(json_correction_llm(json_generated), f)
-    with open(xml_path) as f:
-        xml_generated = f.read()
-    with open(xml_path, "w") as f:
-        f.write(xml_correction_llm(xml_generated))
+    with open(os.path.join(args.backend + "_output", md_path), "w") as f:
+        f.write(md)
+        print(f"Written Markdown to: {md_path}")
 
     # QA summary
     pages = len(doc["document"]["pages"])
